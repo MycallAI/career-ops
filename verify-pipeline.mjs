@@ -28,17 +28,35 @@ const STATES_FILE = existsSync(join(CAREER_OPS, 'templates/states.yml'))
   ? join(CAREER_OPS, 'templates/states.yml')
   : join(CAREER_OPS, 'states.yml');
 
-const CANONICAL_STATUSES = [
-  'evaluada', 'aplicado', 'respondido', 'entrevista',
-  'oferta', 'rechazado', 'descartado', 'no aplicar',
-];
+// Build canonical statuses and aliases from states.yml
+function loadStates() {
+  const canonical = [];
+  const aliases = {};
+  if (existsSync(STATES_FILE)) {
+    const raw = readFileSync(STATES_FILE, 'utf-8');
+    // Parse states from YAML (simple regex extraction)
+    const idMatches = [...raw.matchAll(/^\s+-\s+id:\s+(.+)$/gm)];
+    const labelMatches = [...raw.matchAll(/^\s+label:\s+(.+)$/gm)];
+    const aliasMatches = [...raw.matchAll(/^\s+aliases:\s+\[([^\]]*)\]/gm)];
+    for (let i = 0; i < idMatches.length; i++) {
+      const id = idMatches[i][1].trim().toLowerCase();
+      canonical.push(id);
+      if (labelMatches[i]) {
+        const label = labelMatches[i][1].trim().toLowerCase();
+        if (label !== id) aliases[label] = id;
+      }
+      if (aliasMatches[i]) {
+        const aliasList = aliasMatches[i][1].split(',').map(a => a.trim().replace(/['"]/g, '').toLowerCase()).filter(Boolean);
+        for (const a of aliasList) {
+          if (a !== id) aliases[a] = id;
+        }
+      }
+    }
+  }
+  return { canonical, aliases };
+}
 
-const ALIASES = {
-  'enviada': 'aplicado', 'aplicada': 'aplicado', 'applied': 'aplicado', 'sent': 'aplicado',
-  'cerrada': 'descartado', 'descartada': 'descartado', 'cancelada': 'descartado',
-  'rechazada': 'rechazado',
-  'no_aplicar': 'no aplicar', 'skip': 'no aplicar', 'monitor': 'no aplicar',
-};
+const { canonical: CANONICAL_STATUSES, aliases: ALIASES } = loadStates();
 
 let errors = 0;
 let warnings = 0;

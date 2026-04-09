@@ -10,6 +10,7 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BATCH_DIR="$SCRIPT_DIR"
 INPUT_FILE="$BATCH_DIR/batch-input.tsv"
 STATE_FILE="$BATCH_DIR/batch-state.tsv"
+STATE_LOCK="$BATCH_DIR/batch-state.lock"
 PROMPT_FILE="$BATCH_DIR/batch-prompt.md"
 LOGS_DIR="$BATCH_DIR/logs"
 TRACKER_DIR="$BATCH_DIR/tracker-additions"
@@ -74,7 +75,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# Lock file to prevent double execution
+# Runner lock file to prevent double execution
 acquire_lock() {
   if [[ -f "$LOCK_FILE" ]]; then
     local old_pid
@@ -96,6 +97,22 @@ release_lock() {
 }
 
 trap release_lock EXIT
+
+# State file mutex — uses noclobber to safely acquire across subshells
+acquire_state_lock() {
+  local deadline=$(( $(date +%s) + 30 ))
+  while ! (set -C; echo $$ > "$STATE_LOCK") 2>/dev/null; do
+    if (( $(date +%s) > deadline )); then
+      echo "ERROR: Could not acquire state lock after 30s — stale lock at $STATE_LOCK?" >&2
+      exit 1
+    fi
+    sleep 0.1
+  done
+}
+
+release_state_lock() {
+  rm -f "$STATE_LOCK"
+}
 
 # Validate prerequisites
 check_prerequisites() {
@@ -124,7 +141,7 @@ init_state() {
   fi
 }
 
-# Get status of an offer from state file
+# Get status of an offer from state file (call only while holding state lock)
 get_status() {
   local id="$1"
   if [[ ! -f "$STATE_FILE" ]]; then
@@ -132,11 +149,11 @@ get_status() {
     return
   fi
   local status
-  status=$(awk -F'\t' -v id="$id" '$1 == id { print $3 }' "$STATE_FILE")
+  status=$(awk -F'\t' -v id="$id" '$1 == id { print $3; exit }' "$STATE_FILE")
   echo "${status:-none}"
 }
 
-# Get retry count for an offer
+# Get retry count for an offer (call only while holding state lock)
 get_retries() {
   local id="$1"
   if [[ ! -f "$STATE_FILE" ]]; then
@@ -144,11 +161,12 @@ get_retries() {
     return
   fi
   local retries
-  retries=$(awk -F'\t' -v id="$id" '$1 == id { print $9 }' "$STATE_FILE")
+  retries=$(awk -F'\t' -v id="$id" '$1 == id { print $9; exit }' "$STATE_FILE" | tr -d '[:space:]')
   echo "${retries:-0}"
 }
 
-# Calculate next report number
+# Calculate next report number — reads reports dir + state file.
+# Call only while holding state lock.
 next_report_num() {
   local max_num=0
   if [[ -d "$REPORTS_DIR" ]]; then
@@ -157,13 +175,12 @@ next_report_num() {
       local basename
       basename=$(basename "$f")
       local num="${basename%%-*}"
-      num=$((10#$num)) # Remove leading zeros for arithmetic
+      num=$((10#$num))
       if (( num > max_num )); then
         max_num=$num
       fi
     done
   fi
-  # Also check state file for assigned report numbers
   if [[ -f "$STATE_FILE" ]]; then
     while IFS=$'\t' read -r _ _ _ _ _ rnum _ _ _; do
       [[ "$rnum" == "report_num" || "$rnum" == "-" || -z "$rnum" ]] && continue
@@ -176,7 +193,8 @@ next_report_num() {
   printf '%03d' $((max_num + 1))
 }
 
-# Update or insert state for an offer
+# Update or insert state for an offer.
+# Call only while holding state lock.
 update_state() {
   local id="$1" url="$2" status="$3" started="$4" completed="$5" report_num="$6" score="$7" error="$8" retries="$9"
 
@@ -184,15 +202,13 @@ update_state() {
     init_state
   fi
 
-  local tmp="$STATE_FILE.tmp"
+  local tmp="$STATE_FILE.tmp.$$"
   local found=false
 
-  # Write header
   head -1 "$STATE_FILE" > "$tmp"
 
-  # Process existing lines
   while IFS=$'\t' read -r sid surl sstatus sstarted scompleted sreport sscore serror sretries; do
-    [[ "$sid" == "id" ]] && continue  # skip header
+    [[ "$sid" == "id" ]] && continue
     if [[ "$sid" == "$id" ]]; then
       printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$id" "$url" "$status" "$started" "$completed" "$report_num" "$score" "$error" "$retries" >> "$tmp"
@@ -215,22 +231,23 @@ update_state() {
 process_offer() {
   local id="$1" url="$2" source="$3" notes="$4"
 
-  local report_num
-  report_num=$(next_report_num)
   local date
   date=$(date +%Y-%m-%d)
   local started_at
   started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  local retries
-  retries=$(get_retries "$id")
   local jd_file="/tmp/batch-jd-${id}.txt"
 
+  # Assign report number and mark in-progress — locked to prevent collisions
+  acquire_state_lock
+  local report_num
+  report_num=$(next_report_num)
+  local retries
+  retries=$(get_retries "$id")
   echo "--- Processing offer #$id: $url (report $report_num, attempt $((retries + 1)))"
-
-  # Mark as in-progress
   update_state "$id" "$url" "processing" "$started_at" "-" "$report_num" "-" "-" "$retries"
+  release_state_lock
 
-  # Build the prompt with placeholders replaced
+  # Build the prompt
   local prompt
   prompt="Procesa esta oferta de empleo. Ejecuta el pipeline completo: evaluación A-F + report .md + PDF + tracker line."
   prompt="$prompt URL: $url"
@@ -241,7 +258,7 @@ process_offer() {
 
   local log_file="$LOGS_DIR/${report_num}-${id}.log"
 
-  # Prepare system prompt with placeholders resolved
+  # Resolve placeholders in the prompt template
   local resolved_prompt="$BATCH_DIR/.resolved-prompt-${id}.md"
   sed \
     -e "s|{{URL}}|${url}|g" \
@@ -251,7 +268,7 @@ process_offer() {
     -e "s|{{ID}}|${id}|g" \
     "$PROMPT_FILE" > "$resolved_prompt"
 
-  # Launch claude -p worker (uses default model from Claude Max subscription)
+  # Launch claude -p worker
   local exit_code=0
   claude -p \
     --dangerously-skip-permissions \
@@ -259,21 +276,20 @@ process_offer() {
     "$prompt" \
     > "$log_file" 2>&1 || exit_code=$?
 
-  # Cleanup resolved prompt
   rm -f "$resolved_prompt"
 
   local completed_at
   completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
+  # Write final state — locked
+  acquire_state_lock
   if [[ $exit_code -eq 0 ]]; then
-    # Try to extract score from worker output
     local score="-"
     local score_match
-    score_match=$(grep -oP '"score":\s*[\d.]+' "$log_file" 2>/dev/null | head -1 | grep -oP '[\d.]+' || true)
+    score_match=$(grep -oE '"score":[[:space:]]*[0-9.]+' "$log_file" 2>/dev/null | head -1 | grep -oE '[0-9.]+' || true)
     if [[ -n "$score_match" ]]; then
       score="$score_match"
     fi
-
     update_state "$id" "$url" "completed" "$started_at" "$completed_at" "$report_num" "$score" "-" "$retries"
     echo "    ✅ Completed (score: $score, report: $report_num)"
   else
@@ -283,16 +299,17 @@ process_offer() {
     update_state "$id" "$url" "failed" "$started_at" "$completed_at" "$report_num" "-" "$error_msg" "$retries"
     echo "    ❌ Failed (attempt $retries, exit code $exit_code)"
   fi
+  release_state_lock
 }
 
 # Merge tracker additions into applications.md
 merge_tracker() {
   echo ""
   echo "=== Merging tracker additions ==="
-  node "$PROJECT_DIR/career-ops/merge-tracker.mjs"
+  node "$PROJECT_DIR/merge-tracker.mjs"
   echo ""
   echo "=== Verifying pipeline integrity ==="
-  node "$PROJECT_DIR/career-ops/verify-pipeline.mjs" || echo "⚠️  Verification found issues (see above)"
+  node "$PROJECT_DIR/verify-pipeline.mjs" || echo "⚠️  Verification found issues (see above)"
 }
 
 # Print summary
@@ -342,7 +359,6 @@ main() {
 
   init_state
 
-  # Count input offers (skip header, ignore blank lines)
   local total_input
   total_input=$(tail -n +2 "$INPUT_FILE" | grep -c '[^[:space:]]' 2>/dev/null || true)
   total_input="${total_input:-0}"
@@ -357,17 +373,17 @@ main() {
   echo "Input: $total_input offers"
   echo ""
 
-  # Build list of offers to process
+  # Build list of offers to process (read state under lock)
   local -a pending_ids=()
   local -a pending_urls=()
   local -a pending_sources=()
   local -a pending_notes=()
 
+  acquire_state_lock
   while IFS=$'\t' read -r id url source notes; do
-    [[ "$id" == "id" ]] && continue  # skip header
+    [[ "$id" == "id" ]] && continue
     [[ -z "$id" || -z "$url" ]] && continue
 
-    # Skip if before start-from
     if (( id < START_FROM )); then
       continue
     fi
@@ -376,11 +392,9 @@ main() {
     status=$(get_status "$id")
 
     if [[ "$RETRY_FAILED" == "true" ]]; then
-      # Only process failed offers
       if [[ "$status" != "failed" ]]; then
         continue
       fi
-      # Check retry limit
       local retries
       retries=$(get_retries "$id")
       if (( retries >= MAX_RETRIES )); then
@@ -388,11 +402,9 @@ main() {
         continue
       fi
     else
-      # Skip completed offers
       if [[ "$status" == "completed" ]]; then
         continue
       fi
-      # Skip failed offers that hit retry limit (unless --retry-failed)
       if [[ "$status" == "failed" ]]; then
         local retries
         retries=$(get_retries "$id")
@@ -408,6 +420,7 @@ main() {
     pending_sources+=("$source")
     pending_notes+=("$notes")
   done < "$INPUT_FILE"
+  release_state_lock
 
   local pending_count=${#pending_ids[@]}
 
@@ -420,12 +433,13 @@ main() {
   echo "Pending: $pending_count offers"
   echo ""
 
-  # Dry run: just list
   if [[ "$DRY_RUN" == "true" ]]; then
     echo "=== DRY RUN (no processing) ==="
     for i in "${!pending_ids[@]}"; do
+      acquire_state_lock
       local status
       status=$(get_status "${pending_ids[$i]}")
+      release_state_lock
       echo "  #${pending_ids[$i]}: ${pending_urls[$i]} [${pending_sources[$i]}] (status: $status)"
     done
     echo ""
@@ -435,20 +449,18 @@ main() {
 
   # Process offers
   if (( PARALLEL <= 1 )); then
-    # Sequential processing
     for i in "${!pending_ids[@]}"; do
       process_offer "${pending_ids[$i]}" "${pending_urls[$i]}" "${pending_sources[$i]}" "${pending_notes[$i]}"
     done
   else
-    # Parallel processing with job control
     local running=0
     local -a pids=()
     local -a pid_ids=()
 
     for i in "${!pending_ids[@]}"; do
-      # Wait if we're at parallel limit
+      # Wait if at parallel limit
       while (( running >= PARALLEL )); do
-        # Wait for any child to finish
+        local j
         for j in "${!pids[@]}"; do
           if ! kill -0 "${pids[$j]}" 2>/dev/null; then
             wait "${pids[$j]}" 2>/dev/null || true
@@ -457,13 +469,14 @@ main() {
             running=$((running - 1))
           fi
         done
-        # Compact arrays
-        pids=("${pids[@]}")
-        pid_ids=("${pid_ids[@]}")
-        sleep 1
+        # Compact arrays (guard against empty)
+        if (( ${#pids[@]} > 0 )); then
+          pids=("${pids[@]}")
+          pid_ids=("${pid_ids[@]}")
+        fi
+        sleep 0.5
       done
 
-      # Launch worker in background
       process_offer "${pending_ids[$i]}" "${pending_urls[$i]}" "${pending_sources[$i]}" "${pending_notes[$i]}" &
       pids+=($!)
       pid_ids+=("${pending_ids[$i]}")
@@ -471,15 +484,14 @@ main() {
     done
 
     # Wait for remaining workers
-    for pid in "${pids[@]}"; do
-      wait "$pid" 2>/dev/null || true
-    done
+    if (( ${#pids[@]} > 0 )); then
+      for pid in "${pids[@]}"; do
+        wait "$pid" 2>/dev/null || true
+      done
+    fi
   fi
 
-  # Merge tracker additions
   merge_tracker
-
-  # Print summary
   print_summary
 }
 
